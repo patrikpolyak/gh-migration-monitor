@@ -6,10 +6,14 @@ import (
 	"github.com/mona-actions/gh-migration-monitor/internal/models"
 )
 
+// ProgressFunc is called with all migrations fetched so far after each page.
+type ProgressFunc func(migrations []models.Migration)
+
 // GitHubClient defines the interface for GitHub API operations
 type GitHubClient interface {
-	// ListMigrations returns all migrations for the specified organization
-	ListMigrations(ctx context.Context, org string, isLegacy bool) ([]models.Migration, error)
+	// ListMigrations returns all migrations for the specified organization.
+	// onProgress is optional and receives the migrations fetched so far after each page.
+	ListMigrations(ctx context.Context, org string, isLegacy bool, onProgress ProgressFunc) ([]models.Migration, error)
 }
 
 // APIError represents an API error

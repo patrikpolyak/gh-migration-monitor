@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -32,6 +33,10 @@ type Dashboard struct {
 	app              *tview.Application
 	refreshFunc      func()
 	isRefreshing     bool
+	pageSize         int
+	statusMu         sync.Mutex
+	pagesFetched     int
+	counts           statusCounts
 	isShuttingDown   bool
 	currentFilter    FilterOption
 	allMigrations    []models.Migration
@@ -113,6 +118,11 @@ func (d *Dashboard) UpdateData(summary *models.MigrationSummary, organization st
 	d.applyFilter()
 }
 
+// HasData reports whether any migrations have been loaded into the dashboard.
+func (d *Dashboard) HasData() bool {
+	return len(d.allMigrations) > 0
+}
+
 // applyFilter filters the migrations based on the current filter setting and search term
 func (d *Dashboard) applyFilter() {
 	if len(d.allMigrations) == 0 {
@@ -185,13 +195,8 @@ func (d *Dashboard) SetupGrid() *tview.Grid {
 		// Add the main migration table
 		d.MainGrid.AddItem(d.AllMigrations.Table, 0, 0, 1, 1, 0, 0, true)
 
-		// Create a flex layout for the bottom row containing command bar and status bar
-		bottomFlex := tview.NewFlex().
-			AddItem(d.CommandBar, 0, 3, false).
-			AddItem(d.StatusBar, 0, 1, false)
-
-		// Add bottom flex at the bottom with fixed height of 1 row
-		d.MainGrid.AddItem(bottomFlex, 1, 0, 1, 1, 0, 0, false)
+		// Bottom row: status bar overlays the right side of the command bar
+		d.MainGrid.AddItem(newBottomBar(d.CommandBar, d.StatusBar), 1, 0, 1, 1, 0, 0, false)
 	}
 
 	return d.MainGrid
@@ -377,6 +382,49 @@ func (d *Dashboard) SetRefreshFunc(f func()) {
 	d.refreshFunc = f
 }
 
+// statusCounts holds the number of migrations per state
+type statusCounts struct {
+	queued, inProgress, succeeded, failed int
+}
+
+func countsOf(summary *models.MigrationSummary) statusCounts {
+	return statusCounts{
+		queued:     len(summary.Queued),
+		inProgress: len(summary.InProgress),
+		succeeded:  len(summary.Succeeded),
+		failed:     len(summary.Failed),
+	}
+}
+
+func (c statusCounts) String() string {
+	// Colors match the status column in the migration table
+	return fmt.Sprintf("[blue::b]Queued: %d[white::] | [yellow::b]In Progress: %d[white::] | [green::b]Succeeded: %d[white::] | [red::b]Failed: %d",
+		c.queued, c.inProgress, c.succeeded, c.failed)
+}
+
+// SetProgress records refresh progress: pages fetched so far and the counts per state
+func (d *Dashboard) SetProgress(summary *models.MigrationSummary, pagesFetched int) {
+	if summary == nil {
+		return
+	}
+	d.statusMu.Lock()
+	defer d.statusMu.Unlock()
+	d.pagesFetched = pagesFetched
+	d.counts = countsOf(summary)
+}
+
+// statusSnapshot returns the current page count and per-state counts
+func (d *Dashboard) statusSnapshot() (int, statusCounts) {
+	d.statusMu.Lock()
+	defer d.statusMu.Unlock()
+	return d.pagesFetched, d.counts
+}
+
+// SetPageSize sets the pagination size shown in the refresh indicator
+func (d *Dashboard) SetPageSize(pageSize int) {
+	d.pageSize = pageSize
+}
+
 // ShowRefreshing displays a loading indicator with animation
 func (d *Dashboard) ShowRefreshing() {
 	if d.app == nil || d.isShuttingDown {
@@ -385,6 +433,10 @@ func (d *Dashboard) ShowRefreshing() {
 
 	// Cancel any existing refresh animation
 	d.HideRefreshing()
+
+	d.statusMu.Lock()
+	d.pagesFetched = 0
+	d.statusMu.Unlock()
 
 	d.isRefreshing = true
 	d.refreshingCtx, d.refreshingCancel = context.WithCancel(context.Background())
@@ -410,7 +462,8 @@ func (d *Dashboard) ShowRefreshing() {
 				currentFrame := frames[frameIndex]
 				d.app.QueueUpdateDraw(func() {
 					if d.isRefreshing {
-						d.StatusBar.SetText(fmt.Sprintf("[yellow::b]%s Refreshing...", currentFrame))
+						pages, counts := d.statusSnapshot()
+						d.StatusBar.SetText(fmt.Sprintf("%s[white::] | [yellow::b]%s Refreshing (page size: %d, pages: %d)", counts, currentFrame, d.pageSize, pages))
 					}
 				})
 				frameIndex = (frameIndex + 1) % len(frames)
@@ -438,7 +491,8 @@ func (d *Dashboard) HideRefreshing() {
 	if !d.isShuttingDown {
 		d.app.QueueUpdateDraw(func() {
 			currentTime := time.Now().Format("15:04:05")
-			d.StatusBar.SetText(fmt.Sprintf("[green::b]Last updated: %s", currentTime))
+			pages, counts := d.statusSnapshot()
+			d.StatusBar.SetText(fmt.Sprintf("%s[white::] | [green::b]Last updated: %s (pages: %d)", counts, currentTime, pages))
 		})
 	}
 }
@@ -464,4 +518,34 @@ func (d *Dashboard) Cleanup() {
 		d.refreshingCtx = nil
 	}
 	d.isRefreshing = false
+}
+
+// bottomBar draws the command bar across the full width and the status bar on top
+// of its right side, sized to its content so the status is never cut off.
+type bottomBar struct {
+	*tview.Box
+	commandBar *tview.TextView
+	statusBar  *tview.TextView
+}
+
+func newBottomBar(commandBar, statusBar *tview.TextView) *bottomBar {
+	return &bottomBar{Box: tview.NewBox(), commandBar: commandBar, statusBar: statusBar}
+}
+
+// Draw implements tview.Primitive
+func (b *bottomBar) Draw(screen tcell.Screen) {
+	x, y, width, height := b.GetInnerRect()
+
+	b.commandBar.SetRect(x, y, width, height)
+	b.commandBar.Draw(screen)
+
+	statusWidth := tview.TaggedStringWidth(b.statusBar.GetText(false)) + 1
+	if statusWidth > width {
+		statusWidth = width
+	}
+	if statusWidth <= 1 {
+		return
+	}
+	b.statusBar.SetRect(x+width-statusWidth, y, statusWidth, height)
+	b.statusBar.Draw(screen)
 }

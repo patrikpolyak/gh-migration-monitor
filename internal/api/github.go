@@ -15,17 +15,26 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// maxPageSize is the largest page size GitHub accepts
+const maxPageSize = 100
+
 // githubClient implements the GitHubClient interface
 type githubClient struct {
 	restClient    *github.Client
 	graphqlClient *githubv4.Client
 	rateLimiter   *http.Client
+	pageSize      int
+	since         func() time.Time
 }
 
 // NewGitHubClient creates a new GitHub API client
-func NewGitHubClient(token string, isLegacy bool) (GitHubClient, error) {
+func NewGitHubClient(token string, isLegacy bool, pageSize int, since func() time.Time) (GitHubClient, error) {
 	if token == "" {
 		return nil, fmt.Errorf("github token is required")
+	}
+
+	if pageSize < 1 {
+		pageSize = 100
 	}
 
 	ctx := context.Background()
@@ -52,6 +61,8 @@ func NewGitHubClient(token string, isLegacy bool) (GitHubClient, error) {
 		restClient:    github.NewClient(rateLimiter),
 		graphqlClient: githubv4.NewClient(rateLimiter),
 		rateLimiter:   rateLimiter,
+		pageSize:      pageSize,
+		since:         since,
 	}, nil
 }
 
@@ -63,15 +74,23 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // ListMigrations implements GitHubClient.ListMigrations
-func (c *githubClient) ListMigrations(ctx context.Context, org string, isLegacy bool) ([]models.Migration, error) {
+func (c *githubClient) ListMigrations(ctx context.Context, org string, isLegacy bool, onProgress ProgressFunc) ([]models.Migration, error) {
 	if isLegacy {
-		return c.listLegacyMigrations(ctx, org)
+		return c.listLegacyMigrations(ctx, org, onProgress)
 	}
-	return c.listGEIMigrations(ctx, org)
+	return c.listGEIMigrations(ctx, org, onProgress)
+}
+
+// cutoff returns the oldest creation time to include, or the zero time for no cutoff
+func (c *githubClient) cutoff() time.Time {
+	if c.since == nil {
+		return time.Time{}
+	}
+	return c.since()
 }
 
 // listGEIMigrations retrieves migrations using the new GEI API
-func (c *githubClient) listGEIMigrations(ctx context.Context, org string) ([]models.Migration, error) {
+func (c *githubClient) listGEIMigrations(ctx context.Context, org string, onProgress ProgressFunc) ([]models.Migration, error) {
 	var query struct {
 		Organization struct {
 			RepositoryMigrations struct {
@@ -95,13 +114,25 @@ func (c *githubClient) listGEIMigrations(ctx context.Context, org string) ([]mod
 
 	variables := map[string]interface{}{
 		"orgName": githubv4.String(org),
-		"first":   githubv4.Int(100),
+		"first":   githubv4.Int(c.pageSize),
 		"after":   (*githubv4.String)(nil),
 	}
 
+	// GitHub offers no server-side time filter for repositoryMigrations, and its
+	// orderBy/before cursors can't be used to skip old entries without dropping
+	// others, so older entries are fetched and filtered out here.
+	cutoff := c.cutoff()
+
 	var migrations []models.Migration
 
+	// GitHub treats the "after" cursor of repositoryMigrations as inclusive, so each
+	// page after the first starts with the last item of the previous page. Dedupe by
+	// ID, and grow the page size when a page adds nothing new (e.g. page size 1).
+	seen := make(map[string]struct{})
+	first := c.pageSize
+
 	for {
+		variables["first"] = githubv4.Int(first)
 		if err := c.graphqlClient.Query(ctx, &query, variables); err != nil {
 			return nil, &APIError{
 				StatusCode: 0,
@@ -110,11 +141,22 @@ func (c *githubClient) listGEIMigrations(ctx context.Context, org string) ([]mod
 			}
 		}
 
+		added := 0
 		for _, edge := range query.Organization.RepositoryMigrations.Edges {
+			if _, ok := seen[edge.Node.Id]; ok {
+				continue
+			}
+			seen[edge.Node.Id] = struct{}{}
+			added++
+
 			createdAt, err := time.Parse(time.RFC3339, edge.Node.CreatedAt)
 			if err != nil {
 				log.Printf("Failed to parse created_at time %s: %v", edge.Node.CreatedAt, err)
 				createdAt = time.Time{}
+			}
+
+			if !cutoff.IsZero() && !createdAt.IsZero() && createdAt.Before(cutoff) {
+				continue
 			}
 
 			migration := models.Migration{
@@ -129,8 +171,19 @@ func (c *githubClient) listGEIMigrations(ctx context.Context, org string) ([]mod
 			migrations = append(migrations, migration)
 		}
 
+		if onProgress != nil {
+			onProgress(migrations)
+		}
+
 		if !query.Organization.RepositoryMigrations.PageInfo.HasNextPage {
 			break
+		}
+
+		if added == 0 {
+			if first >= maxPageSize {
+				break
+			}
+			first++
 		}
 		variables["after"] = githubv4.NewString(query.Organization.RepositoryMigrations.PageInfo.EndCursor)
 	}
@@ -139,7 +192,7 @@ func (c *githubClient) listGEIMigrations(ctx context.Context, org string) ([]mod
 }
 
 // listLegacyMigrations retrieves migrations using the legacy migration API
-func (c *githubClient) listLegacyMigrations(ctx context.Context, org string) ([]models.Migration, error) {
+func (c *githubClient) listLegacyMigrations(ctx context.Context, org string, onProgress ProgressFunc) ([]models.Migration, error) {
 	var migrationStatusQuery struct {
 		Organization struct {
 			Migration struct {
@@ -161,14 +214,15 @@ func (c *githubClient) listLegacyMigrations(ctx context.Context, org string) ([]
 		} `graphql:"organization(login: $orgName)"`
 	}
 
-	opt := &github.ListOptions{PerPage: 100}
+	opt := &github.ListOptions{PerPage: c.pageSize}
 	variables := map[string]interface{}{
 		"orgName": githubv4.String(org),
-		"first":   githubv4.Int(100),
+		"first":   githubv4.Int(c.pageSize),
 		"after":   (*githubv4.String)(nil),
 		"guid":    githubv4.String(""),
 	}
 
+	cutoff := c.cutoff()
 	var migrations []models.Migration
 
 	for {
@@ -187,47 +241,59 @@ func (c *githubClient) listLegacyMigrations(ctx context.Context, org string) ([]
 			}
 
 			variables["guid"] = githubv4.String(*migration.GUID)
-			if err := c.graphqlClient.Query(ctx, &migrationStatusQuery, variables); err != nil {
-				log.Printf("Error executing Migration Status GraphQL query: %v", err)
-				continue
-			}
+			variables["after"] = (*githubv4.String)(nil)
 
-			for _, resource := range migrationStatusQuery.Organization.Migration.MigratableResources.Nodes {
-				if resource.ModelName == "repository" {
-					createdAt := time.Time{}
-					if migration.CreatedAt != nil {
-						if parsed, err := time.Parse(time.RFC3339, *migration.CreatedAt); err == nil {
-							createdAt = parsed
-						}
-					}
-
-					migrationURL := ""
-					if migration.URL != nil {
-						migrationURL = *migration.URL
-					}
-
-					state := ""
-					if migration.State != nil {
-						state = strings.ToUpper(*migration.State)
-					}
-
-					m := models.Migration{
-						ID:              *migration.GUID,
-						RepositoryName:  string(resource.TargetUrl),
-						State:           models.State(state),
-						CreatedAt:       createdAt,
-						FailureReason:   "Unavailable for legacy migrations",
-						MigrationLogURL: migrationURL,
-					}
-
-					migrations = append(migrations, m)
+			createdAt := time.Time{}
+			if migration.CreatedAt != nil {
+				if parsed, err := time.Parse(time.RFC3339, *migration.CreatedAt); err == nil {
+					createdAt = parsed
 				}
 			}
 
-			if !migrationStatusQuery.Organization.Migration.MigratableResources.PageInfo.HasNextPage {
+			if !cutoff.IsZero() && !createdAt.IsZero() && createdAt.Before(cutoff) {
 				continue
 			}
-			variables["after"] = githubv4.NewString(migrationStatusQuery.Organization.Migration.MigratableResources.PageInfo.EndCursor)
+
+			migrationURL := ""
+			if migration.URL != nil {
+				migrationURL = *migration.URL
+			}
+
+			state := ""
+			if migration.State != nil {
+				state = strings.ToUpper(*migration.State)
+			}
+
+			// Page through all migratable resources of this migration
+			for {
+				if err := c.graphqlClient.Query(ctx, &migrationStatusQuery, variables); err != nil {
+					log.Printf("Error executing Migration Status GraphQL query: %v", err)
+					break
+				}
+
+				resources := migrationStatusQuery.Organization.Migration.MigratableResources
+				for _, resource := range resources.Nodes {
+					if resource.ModelName == "repository" {
+						migrations = append(migrations, models.Migration{
+							ID:              *migration.GUID,
+							RepositoryName:  string(resource.TargetUrl),
+							State:           models.State(state),
+							CreatedAt:       createdAt,
+							FailureReason:   "Unavailable for legacy migrations",
+							MigrationLogURL: migrationURL,
+						})
+					}
+				}
+
+				if !resources.PageInfo.HasNextPage {
+					break
+				}
+				variables["after"] = githubv4.NewString(resources.PageInfo.EndCursor)
+			}
+		}
+
+		if onProgress != nil {
+			onProgress(migrations)
 		}
 
 		if resp.NextPage == 0 {

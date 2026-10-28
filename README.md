@@ -58,6 +58,9 @@ gh migration-monitor --organization myorg --legacy
 | `--organization` | `-o`  | GitHub organization       | Yes      |
 | `--github-token` | `-t`  | GitHub token              | No*      |
 | `--legacy`       | `-l`  | Monitor legacy migrations | No       |
+| `--page-size`    |       | Pagination size, 1-100 (default 100) | No |
+| `--since`        |       | Hide migrations created before a timestamp, date (`2026-10-01`) or age (`36h`, `7d`) | No |
+| `--timeout`      |       | Max duration of one refresh, e.g. `90s`, `15m` (default 10m) | No |
 
 *Can use `GHMM_GITHUB_TOKEN` environment variable instead.
 
@@ -68,6 +71,9 @@ gh migration-monitor --organization myorg --legacy
 export GHMM_GITHUB_TOKEN="ghp_xxxxxxxxxxxx"
 export GHMM_GITHUB_ORGANIZATION="myorg"
 export GHMM_ISLEGACY="true"  # for legacy migrations
+export GHMM_SINCE="7d"  # hide migrations older than 7 days
+export GHMM_TIMEOUT="15m"  # max duration of one refresh (default 10m)
+export GHMM_PAGE_SIZE="25"  # smaller pagination size (1-100, default 100)
 ```
 
 ### Config File
@@ -78,6 +84,9 @@ github:
   organization: 'myorg'
 migration:
   is_legacy: false
+  since: 7d            # Hide migrations older than this (timestamp, date or age)
+  timeout: 10m         # Max duration of one refresh
+  page_size: 100       # Pagination size (1-100)
 output:
   format: 'table'      # Output format (reserved for future use)
   quiet: false         # Quiet mode (reserved for future use)

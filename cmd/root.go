@@ -10,6 +10,7 @@ import (
 
 	"github.com/mona-actions/gh-migration-monitor/internal/api"
 	"github.com/mona-actions/gh-migration-monitor/internal/config"
+	"github.com/mona-actions/gh-migration-monitor/internal/models"
 	"github.com/mona-actions/gh-migration-monitor/internal/services"
 	"github.com/mona-actions/gh-migration-monitor/internal/ui"
 	"github.com/rivo/tview"
@@ -20,6 +21,9 @@ var (
 	organization string
 	githubToken  string
 	legacy       bool
+	pageSize     int
+	timeout      time.Duration
+	since        string
 
 	// Version info
 	version   = "dev"
@@ -61,6 +65,9 @@ func init() {
 	// Optional flags
 	rootCmd.Flags().StringVarP(&githubToken, "github-token", "t", "", "GitHub token (can also be set via GHMM_GITHUB_TOKEN)")
 	rootCmd.Flags().BoolVarP(&legacy, "legacy", "l", false, "Monitor legacy migrations")
+	rootCmd.Flags().DurationVar(&timeout, "timeout", 0, "Maximum duration of a single refresh, e.g. 90s or 15m (can also be set via GHMM_TIMEOUT; default 10m)")
+	rootCmd.Flags().StringVar(&since, "since", "", "Hide migrations created before this point: timestamp, date (2006-01-02) or age such as 36h or 7d (can also be set via GHMM_SINCE)")
+	rootCmd.Flags().IntVar(&pageSize, "page-size", 0, "Pagination size for API requests, 1-100 (can also be set via GHMM_PAGE_SIZE; default 100)")
 }
 
 func initConfig() {
@@ -90,13 +97,29 @@ func runMigrationMonitor(cmd *cobra.Command, args []string) error {
 		cfg.Migration.IsLegacy = legacy
 	}
 
+	if pageSize != 0 {
+		cfg.Migration.PageSize = pageSize
+	}
+
+	if since != "" {
+		cfg.Migration.Since = since
+	}
+	if timeout != 0 {
+		cfg.Migration.Timeout = timeout
+	}
+
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
 
 	// Create GitHub client
-	githubClient, err := api.NewGitHubClient(cfg.GitHub.Token, cfg.Migration.IsLegacy)
+	sinceFunc, err := config.ParseSince(cfg.Migration.Since)
+	if err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+
+	githubClient, err := api.NewGitHubClient(cfg.GitHub.Token, cfg.Migration.IsLegacy, cfg.Migration.PageSize, sinceFunc)
 	if err != nil {
 		return fmt.Errorf("failed to create GitHub client: %w", err)
 	}
@@ -106,6 +129,7 @@ func runMigrationMonitor(cmd *cobra.Command, args []string) error {
 
 	// Create UI dashboard
 	dashboard := ui.NewDashboard()
+	dashboard.SetPageSize(cfg.Migration.PageSize)
 
 	// Setup TUI application
 	app := tview.NewApplication()
@@ -168,10 +192,20 @@ func runMigrationMonitor(cmd *cobra.Command, args []string) error {
 
 func updateDashboard(ctx context.Context, service services.MigrationService, dashboard *ui.Dashboard, cfg *config.Config) {
 	// Create a timeout context for API calls to prevent hanging
-	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	timeoutCtx, cancel := context.WithTimeout(ctx, cfg.Migration.Timeout)
 	defer cancel()
 
-	summary, err := service.ListMigrations(timeoutCtx, cfg.GitHub.Organization, cfg.Migration.IsLegacy)
+	// Show partial results while the first load is still paging; later refreshes
+	// swap in the full result at once so the table doesn't shrink and regrow.
+	initialLoad := !dashboard.HasData()
+	onProgress := func(partial *models.MigrationSummary, pagesFetched int) {
+		dashboard.SetProgress(partial, pagesFetched)
+		if initialLoad {
+			dashboard.UpdateData(partial, cfg.GitHub.Organization)
+		}
+	}
+
+	summary, err := service.ListMigrations(timeoutCtx, cfg.GitHub.Organization, cfg.Migration.IsLegacy, onProgress)
 	if err != nil {
 		// TODO: Add proper error handling/logging
 		return

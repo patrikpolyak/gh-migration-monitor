@@ -10,7 +10,7 @@ import (
 
 // MigrationService handles migration-related business logic
 type MigrationService interface {
-	ListMigrations(ctx context.Context, org string, isLegacy bool) (*models.MigrationSummary, error)
+	ListMigrations(ctx context.Context, org string, isLegacy bool, onProgress func(summary *models.MigrationSummary, pagesFetched int)) (*models.MigrationSummary, error)
 }
 
 // migrationService implements MigrationService
@@ -26,12 +26,26 @@ func NewMigrationService(githubClient api.GitHubClient) MigrationService {
 }
 
 // ListMigrations retrieves and categorizes migrations by state
-func (s *migrationService) ListMigrations(ctx context.Context, org string, isLegacy bool) (*models.MigrationSummary, error) {
-	migrations, err := s.githubClient.ListMigrations(ctx, org, isLegacy)
+func (s *migrationService) ListMigrations(ctx context.Context, org string, isLegacy bool, onProgress func(summary *models.MigrationSummary, pagesFetched int)) (*models.MigrationSummary, error) {
+	var progress api.ProgressFunc
+	if onProgress != nil {
+		pages := 0
+		progress = func(migrations []models.Migration) {
+			pages++
+			onProgress(summarize(migrations), pages)
+		}
+	}
+
+	migrations, err := s.githubClient.ListMigrations(ctx, org, isLegacy, progress)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list migrations: %w", err)
 	}
 
+	return summarize(migrations), nil
+}
+
+// summarize categorizes migrations by state
+func summarize(migrations []models.Migration) *models.MigrationSummary {
 	summary := &models.MigrationSummary{
 		Queued:     make([]models.Migration, 0),
 		InProgress: make([]models.Migration, 0),
@@ -52,5 +66,5 @@ func (s *migrationService) ListMigrations(ctx context.Context, org string, isLeg
 		}
 	}
 
-	return summary, nil
+	return summary
 }
