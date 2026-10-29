@@ -5,8 +5,14 @@ A [GitHub CLI](https://cli.github.com) extension that monitors GitHub Organizati
 ## Quick Start
 
 ```bash
-# Install
-gh extension install mona-actions/gh-migration-monitor
+# Optional: remove the original version if already installed
+gh extension remove migration-monitor
+
+# Clone and install from source (requires Go)
+git clone https://github.com/patrikpolyak/gh-migration-monitor.git
+cd gh-migration-monitor
+go build -o gh-migration-monitor
+gh extension install .
 
 # Run
 gh migration-monitor --organization myorg
@@ -205,8 +211,8 @@ Contributions are welcome! Here's how to get started:
 
 ### Development Setup
 ```bash
-# Fork and clone
-gh repo fork mona-actions/gh-migration-monitor --clone
+# Clone
+git clone https://github.com/patrikpolyak/gh-migration-monitor.git
 cd gh-migration-monitor
 
 # Build and test
